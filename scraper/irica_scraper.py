@@ -142,8 +142,8 @@ def _extract_links_from_soup(soup: BeautifulSoup, page_url: str) -> list[dict]:
         href = a["href"]
         is_excel   = re.search(r"\.(xlsx?|xls)(\?.*)?$", href, re.IGNORECASE)
         is_portal  = re.search(r"ShowFile\.aspx|FileDownload|DownloadFile|GetFile", href, re.IGNORECASE)
-        is_dl_kw   = re.search(r"download|دانلود|فایل", href, re.IGNORECASE)
-        is_dl_kw  |= re.search(r"download|دانلود|فایل", a.get_text(), re.IGNORECASE)
+        is_dl_kw   = (re.search(r"download|دانلود|فایل", href, re.IGNORECASE)
+                      or re.search(r"download|دانلود|فایل", a.get_text(), re.IGNORECASE))
         if is_excel or is_portal or is_dl_kw:
             full_url = urljoin(page_url, href) if not href.startswith("http") else href
             label = a.get_text(strip=True) or Path(urlparse(href).path).stem
