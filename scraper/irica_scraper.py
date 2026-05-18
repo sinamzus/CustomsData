@@ -157,7 +157,7 @@ def find_excel_links(page_url: str, follow_subpages: bool = True) -> list[dict]:
     If the page itself has no file links but has sub-page links, follow those
     one level deeper (category index pages on irica.ir commonly work this way).
     """
-    resp = fetch(page_url)
+    resp = fetch(page_url, timeout=15, retries=2)
     if not resp:
         return []
 
