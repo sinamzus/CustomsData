@@ -9,15 +9,20 @@ Known URL patterns (discovered from irica.ir structure):
                      /files/fa/news/.../*.xlsx
 """
 
-import os
 import re
 import time
 import logging
+import warnings
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+
+# Suppress the urllib3 InsecureRequestWarning — we only skip TLS verification
+# as a last-resort fallback for irica.ir's broken SSL, and we log it ourselves.
+from urllib3.exceptions import InsecureRequestWarning
+warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -30,12 +35,11 @@ STATS_URLS = [
     "https://irica.ir/web_directory/55334-%D8%A2%D9%85%D8%A7%D8%B1.html",
 ]
 
-# Direct annual-stats subdirectory IDs discovered from irica.ir
-# (add more as new years are published)
+# Known stat-directory IDs on irica.ir.
+# 55336 returns 404 for all known slugs so it is excluded.
 KNOWN_STAT_DIRS = [
     55334,  # آمار (root)
     55335,  # آمار سال جاری
-    55336,  # آمارهای سالیانه
     55337,  # آمار صادرات
     55338,  # آمار واردات
     55339,  # آمار ترانزیت
@@ -59,8 +63,13 @@ SESSION.headers.update(HEADERS)
 def fetch(url: str, timeout: int = 30, retries: int = 4) -> requests.Response | None:
     delay = 2
     for attempt in range(retries):
-        # On the last retry, fall back to unverified TLS to handle SSL EOF errors
-        verify = attempt < retries - 1
+        # Only disable TLS verification on the very last retry (and only when
+        # there was at least one prior attempt with verify=True) so that the
+        # InsecureRequestWarning is never triggered on single-shot probes.
+        is_last = attempt == retries - 1
+        verify = not (is_last and retries > 1)
+        if not verify:
+            log.debug("Retrying %s without TLS verification", url)
         try:
             resp = SESSION.get(url, timeout=timeout, allow_redirects=True, verify=verify)
             resp.raise_for_status()
@@ -108,7 +117,7 @@ def discover_stat_pages(base: str) -> list[str]:
                     href = a["href"]
                     if re.search(r"/web_directory/\d+", href):
                         pages.add(urljoin(base, href))
-                break  # found a working slug for this ID, no need to try others
+                break  # found a working slug for this ID
 
     # Also crawl the main stats page
     for stats_url in STATS_URLS:
@@ -126,27 +135,52 @@ def discover_stat_pages(base: str) -> list[str]:
     return sorted(pages)
 
 
-def find_excel_links(page_url: str) -> list[dict]:
-    """Extract all Excel download links from a page."""
+def _extract_links_from_soup(soup: BeautifulSoup, page_url: str) -> list[dict]:
+    """Pull every plausible Excel / file-download link out of a parsed page."""
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        is_excel   = re.search(r"\.(xlsx?|xls)(\?.*)?$", href, re.IGNORECASE)
+        is_portal  = re.search(r"ShowFile\.aspx|FileDownload|DownloadFile|GetFile", href, re.IGNORECASE)
+        is_dl_kw   = re.search(r"download|دانلود|فایل", href, re.IGNORECASE)
+        is_dl_kw  |= re.search(r"download|دانلود|فایل", a.get_text(), re.IGNORECASE)
+        if is_excel or is_portal or is_dl_kw:
+            full_url = urljoin(page_url, href) if not href.startswith("http") else href
+            label = a.get_text(strip=True) or Path(urlparse(href).path).stem
+            links.append({"url": full_url, "label": label, "source_page": page_url})
+    return links
+
+
+def find_excel_links(page_url: str, follow_subpages: bool = True) -> list[dict]:
+    """
+    Extract all Excel download links from a page.
+    If the page itself has no file links but has sub-page links, follow those
+    one level deeper (category index pages on irica.ir commonly work this way).
+    """
     resp = fetch(page_url)
     if not resp:
         return []
 
     soup = BeautifulSoup(resp.text, "lxml")
-    links = []
+    links = _extract_links_from_soup(soup, page_url)
 
+    if links or not follow_subpages:
+        return links
+
+    # No direct file links — check if there are sub-directory links to follow
+    sub_urls: list[str] = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        is_excel = re.search(r"\.(xlsx?|xls)(\?.*)?$", href, re.IGNORECASE)
-        is_portal = "ShowFile.aspx" in href or "FileDownload" in href
-        if is_excel or is_portal:
-            full_url = urljoin(page_url, href) if not href.startswith("http") else href
-            label = a.get_text(strip=True) or Path(urlparse(href).path).stem
-            links.append({
-                "url": full_url,
-                "label": label,
-                "source_page": page_url,
-            })
+        if re.search(r"/web_directory/\d+", href):
+            sub_urls.append(urljoin(page_url, href) if not href.startswith("http") else href)
+
+    for sub_url in sub_urls[:20]:  # cap to avoid runaway crawling
+        sub_resp = fetch(sub_url, timeout=20, retries=2)
+        if not sub_resp:
+            continue
+        sub_soup = BeautifulSoup(sub_resp.text, "lxml")
+        links.extend(_extract_links_from_soup(sub_soup, sub_url))
+        time.sleep(0.3)
 
     return links
 
@@ -213,16 +247,16 @@ def scrape(download: bool = True) -> list[dict]:
 
     # Direct scan of stats pages
     for stats_url in STATS_URLS:
-        direct = find_excel_links(stats_url)
+        direct = find_excel_links(stats_url, follow_subpages=False)
         all_links.extend(direct)
         if direct:
             log.info("Direct links from %s: %d", stats_url, len(direct))
             break
 
-    # Deep crawl sub-pages
+    # Deep crawl sub-pages (each call follows one extra hop if needed)
     sub_pages = discover_stat_pages(working_base)
     for page in sub_pages:
-        links = find_excel_links(page)
+        links = find_excel_links(page, follow_subpages=True)
         all_links.extend(links)
         time.sleep(0.5)
 
