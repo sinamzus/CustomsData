@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>نقشه تجارت ایران</title>
+
+  <!-- Mapbox GL -->
+  <script src="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.js"></script>
+  <link href="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.css" rel="stylesheet" />
+
+  <!-- Deck.gl -->
+  <script src="https://unpkg.com/deck.gl@^9/dist.min.js"></script>
+
+  <!-- Plotly -->
+  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+
+<div id="app">
+  <!-- ── Header ── -->
+  <header>
+    <div class="logo">🗺 نقشه تجارت ایران</div>
+    <div class="header-controls">
+      <label>سال شمسی
+        <select id="yearSelect"></select>
+      </label>
+      <div class="direction-tabs">
+        <button class="tab active" data-dir="export">صادرات</button>
+        <button class="tab" data-dir="import">واردات</button>
+        <button class="tab" data-dir="transit">ترانزیت</button>
+      </div>
+    </div>
+    <div id="summaryBadges" class="badges"></div>
+  </header>
+
+  <!-- ── Main layout ── -->
+  <main>
+    <div id="mapContainer">
+      <div id="deckCanvas"></div>
+      <div id="tooltip" class="tooltip hidden"></div>
+      <div id="mapLegend" class="legend"></div>
+    </div>
+
+    <aside id="sidebar">
+      <section class="card">
+        <h3>شرکای برتر</h3>
+        <div id="partnersList"></div>
+      </section>
+
+      <section class="card">
+        <h3>روند تاریخی</h3>
+        <div id="timeseriesChart"></div>
+      </section>
+
+      <section class="card">
+        <h3>ترکیب کالایی</h3>
+        <div id="treemapChart"></div>
+      </section>
+    </aside>
+  </main>
+</div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>
