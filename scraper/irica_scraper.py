@@ -59,8 +59,10 @@ SESSION.headers.update(HEADERS)
 def fetch(url: str, timeout: int = 30, retries: int = 4) -> requests.Response | None:
     delay = 2
     for attempt in range(retries):
+        # On the last retry, fall back to unverified TLS to handle SSL EOF errors
+        verify = attempt < retries - 1
         try:
-            resp = SESSION.get(url, timeout=timeout, allow_redirects=True)
+            resp = SESSION.get(url, timeout=timeout, allow_redirects=True, verify=verify)
             resp.raise_for_status()
             return resp
         except requests.RequestException as e:
@@ -81,20 +83,32 @@ def _try_base(path: str) -> str | None:
     return None
 
 
+_SLUG_CANDIDATES = [
+    "%D8%A2%D9%85%D8%A7%D8%B1",                          # آمار
+    "%D8%A2%D9%85%D8%A7%D8%B1-%D8%B3%D8%A7%D9%84-%D8%AC%D8%A7%D8%B1%DB%8C",  # آمار-سال-جاری
+    "%D8%A2%D9%85%D8%A7%D8%B1%D9%87%D8%A7%DB%8C-%D8%B3%D8%A7%D9%84%DB%8C%D8%A7%D9%86%D9%87",  # آمارهای-سالیانه
+    "%D8%A2%D9%85%D8%A7%D8%B1-%D8%B5%D8%A7%D8%AF%D8%B1%D8%A7%D8%AA",  # آمار-صادرات
+    "%D8%A2%D9%85%D8%A7%D8%B1-%D9%88%D8%A7%D8%B1%D8%AF%D8%A7%D8%AA",  # آمار-واردات
+    "%D8%A2%D9%85%D8%A7%D8%B1-%D8%AA%D8%B1%D8%A7%D9%86%D8%B2%DB%8C%D8%AA",  # آمار-ترانزیت
+]
+
+
 def discover_stat_pages(base: str) -> list[str]:
     """Crawl the stats directory and return all sub-page URLs."""
     pages: set[str] = set()
 
-    # Try known directory IDs
+    # Try known directory IDs with multiple possible slug suffixes
     for dir_id in KNOWN_STAT_DIRS:
-        url = f"{base}/web_directory/{dir_id}-%D8%A2%D9%85%D8%A7%D8%B1.html"
-        resp = fetch(url, timeout=10, retries=1)
-        if resp:
-            soup = BeautifulSoup(resp.text, "lxml")
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                if re.search(r"/web_directory/\d+", href):
-                    pages.add(urljoin(base, href))
+        for slug in _SLUG_CANDIDATES:
+            url = f"{base}/web_directory/{dir_id}-{slug}.html"
+            resp = fetch(url, timeout=10, retries=1)
+            if resp:
+                soup = BeautifulSoup(resp.text, "lxml")
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    if re.search(r"/web_directory/\d+", href):
+                        pages.add(urljoin(base, href))
+                break  # found a working slug for this ID, no need to try others
 
     # Also crawl the main stats page
     for stats_url in STATS_URLS:
