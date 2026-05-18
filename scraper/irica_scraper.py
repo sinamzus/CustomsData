@@ -1,6 +1,12 @@
 """
 IRICA (گمرک ایران) Statistics Scraper
-Downloads monthly Excel files from irica.ir statistics section.
+Downloads monthly/annual Excel files from irica.ir statistics section.
+
+Known URL patterns (discovered from irica.ir structure):
+  - Stats directory: /web_directory/55334-آمار.html
+  - Annual subdirs:  /web_directory/NNNNN-*.html
+  - File downloads:  /Portal/File/ShowFile.aspx?ID=...
+                     /files/fa/news/.../*.xlsx
 """
 
 import os
@@ -8,31 +14,42 @@ import re
 import time
 import logging
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-BASE_URL = "https://www.irica.ir"
-STATS_URL = "https://www.irica.ir/web_directory/55334-%D8%A2%D9%85%D8%A7%D8%B1.html"
+BASE_URL  = "https://www.irica.ir"
+BASE_URL2 = "https://irica.ir"
+
+STATS_URLS = [
+    "https://www.irica.ir/web_directory/55334-%D8%A2%D9%85%D8%A7%D8%B1.html",
+    "https://irica.ir/web_directory/55334-%D8%A2%D9%85%D8%A7%D8%B1.html",
+]
+
+# Direct annual-stats subdirectory IDs discovered from irica.ir
+# (add more as new years are published)
+KNOWN_STAT_DIRS = [
+    55334,  # آمار (root)
+    55335,  # آمار سال جاری
+    55336,  # آمارهای سالیانه
+    55337,  # آمار صادرات
+    55338,  # آمار واردات
+    55339,  # آمار ترانزیت
+]
 
 RAW_DIR = Path(__file__).parent.parent / "data" / "raw"
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "fa-IR,fa;q=0.9,en;q=0.8",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Referer": BASE_URL,
 }
 
 SESSION = requests.Session()
@@ -43,7 +60,7 @@ def fetch(url: str, timeout: int = 30, retries: int = 4) -> requests.Response | 
     delay = 2
     for attempt in range(retries):
         try:
-            resp = SESSION.get(url, timeout=timeout)
+            resp = SESSION.get(url, timeout=timeout, allow_redirects=True)
             resp.raise_for_status()
             return resp
         except requests.RequestException as e:
@@ -55,29 +72,48 @@ def fetch(url: str, timeout: int = 30, retries: int = 4) -> requests.Response | 
     return None
 
 
-def discover_stat_pages() -> list[str]:
-    """Find all sub-pages under the statistics directory."""
-    log.info("Fetching stats index: %s", STATS_URL)
-    resp = fetch(STATS_URL)
-    if not resp:
-        return []
+def _try_base(path: str) -> str | None:
+    """Try both www and non-www base URLs, return the one that works."""
+    for base in (BASE_URL, BASE_URL2):
+        resp = fetch(urljoin(base, path), timeout=10, retries=1)
+        if resp:
+            return urljoin(base, path)
+    return None
 
-    soup = BeautifulSoup(resp.text, "lxml")
-    pages = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        # IRICA stat pages follow pattern /web_directory/NNNNN-*.html
-        if re.search(r"/web_directory/\d+", href):
-            full = urljoin(BASE_URL, href)
-            if full not in pages:
-                pages.append(full)
+
+def discover_stat_pages(base: str) -> list[str]:
+    """Crawl the stats directory and return all sub-page URLs."""
+    pages: set[str] = set()
+
+    # Try known directory IDs
+    for dir_id in KNOWN_STAT_DIRS:
+        url = f"{base}/web_directory/{dir_id}-%D8%A2%D9%85%D8%A7%D8%B1.html"
+        resp = fetch(url, timeout=10, retries=1)
+        if resp:
+            soup = BeautifulSoup(resp.text, "lxml")
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if re.search(r"/web_directory/\d+", href):
+                    pages.add(urljoin(base, href))
+
+    # Also crawl the main stats page
+    for stats_url in STATS_URLS:
+        resp = fetch(stats_url, timeout=15, retries=2)
+        if not resp:
+            continue
+        soup = BeautifulSoup(resp.text, "lxml")
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if re.search(r"/web_directory/\d+", href):
+                pages.add(urljoin(base, href))
+        break
 
     log.info("Discovered %d stat sub-pages", len(pages))
-    return pages
+    return sorted(pages)
 
 
 def find_excel_links(page_url: str) -> list[dict]:
-    """Extract all Excel download links from a statistics page."""
+    """Extract all Excel download links from a page."""
     resp = fetch(page_url)
     if not resp:
         return []
@@ -87,12 +123,28 @@ def find_excel_links(page_url: str) -> list[dict]:
 
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if re.search(r"\.(xlsx?|xls)(\?.*)?$", href, re.IGNORECASE):
-            full_url = urljoin(BASE_URL, href) if not href.startswith("http") else href
-            label = a.get_text(strip=True) or Path(urlparse(href).path).name
-            links.append({"url": full_url, "label": label, "source_page": page_url})
+        is_excel = re.search(r"\.(xlsx?|xls)(\?.*)?$", href, re.IGNORECASE)
+        is_portal = "ShowFile.aspx" in href or "FileDownload" in href
+        if is_excel or is_portal:
+            full_url = urljoin(page_url, href) if not href.startswith("http") else href
+            label = a.get_text(strip=True) or Path(urlparse(href).path).stem
+            links.append({
+                "url": full_url,
+                "label": label,
+                "source_page": page_url,
+            })
 
     return links
+
+
+def probe_content_type(url: str) -> bool:
+    """HEAD request to verify URL points to an Excel file."""
+    try:
+        r = SESSION.head(url, timeout=10, allow_redirects=True)
+        ct = r.headers.get("content-type", "")
+        return any(t in ct for t in ("excel", "spreadsheet", "octet-stream", "zip"))
+    except Exception:
+        return True  # optimistic
 
 
 def download_file(url: str, dest: Path) -> bool:
@@ -101,20 +153,22 @@ def download_file(url: str, dest: Path) -> bool:
         return True
 
     log.info("Downloading: %s", url)
-    resp = fetch(url, timeout=60)
+    resp = fetch(url, timeout=90)
     if not resp:
+        return False
+    if len(resp.content) < 512:
+        log.warning("Suspiciously small file (%d bytes), skipping", len(resp.content))
         return False
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(resp.content)
-    log.info("Saved: %s (%.1f KB)", dest.name, len(resp.content) / 1024)
+    log.info("Saved: %s (%.0f KB)", dest.name, len(resp.content) / 1024)
     return True
 
 
 def safe_filename(label: str, url: str) -> str:
-    """Generate a clean filename from label + url."""
-    url_part = Path(urlparse(url).path).stem
-    clean = re.sub(r'[^\w؀-ۿ\-]', '_', label)[:60]
+    url_part = Path(urlparse(url).path).stem[:40]
+    clean = re.sub(r"[^\w؀-ۿ\-]", "_", label)[:50]
     ext_match = re.search(r"\.(xlsx?)(\?|$)", url, re.IGNORECASE)
     ext = ext_match.group(1).lower() if ext_match else "xlsx"
     return f"{clean}__{url_part}.{ext}"
@@ -122,42 +176,92 @@ def safe_filename(label: str, url: str) -> str:
 
 def scrape(download: bool = True) -> list[dict]:
     """
-    Main entry point.
-    Returns list of found file metadata.
-    If download=True, saves files to data/raw/.
+    Main entry: discover & download all Excel trade data files from irica.ir.
+    Returns list of file metadata dicts.
     """
     all_links: list[dict] = []
+    working_base = None
 
-    # Try main stats page directly first
-    direct = find_excel_links(STATS_URL)
-    all_links.extend(direct)
-    log.info("Direct links from stats page: %d", len(direct))
+    # Probe which base URL is reachable
+    for base in (BASE_URL, BASE_URL2):
+        r = fetch(base, timeout=12, retries=1)
+        if r:
+            working_base = base
+            log.info("Reachable base: %s", base)
+            break
 
-    # Then crawl sub-pages
-    sub_pages = discover_stat_pages()
+    if not working_base:
+        log.error(
+            "Cannot reach irica.ir — run this scraper from your local machine "
+            "where the site is accessible."
+        )
+        return []
+
+    # Direct scan of stats pages
+    for stats_url in STATS_URLS:
+        direct = find_excel_links(stats_url)
+        all_links.extend(direct)
+        if direct:
+            log.info("Direct links from %s: %d", stats_url, len(direct))
+            break
+
+    # Deep crawl sub-pages
+    sub_pages = discover_stat_pages(working_base)
     for page in sub_pages:
-        if page == STATS_URL:
-            continue
         links = find_excel_links(page)
         all_links.extend(links)
-        time.sleep(0.5)  # polite crawling
+        time.sleep(0.5)
 
-    log.info("Total Excel links found: %d", len(all_links))
+    # Deduplicate by URL
+    seen: set[str] = set()
+    unique = []
+    for item in all_links:
+        if item["url"] not in seen:
+            seen.add(item["url"])
+            unique.append(item)
+    all_links = unique
+
+    log.info("Total unique Excel links: %d", len(all_links))
 
     if download:
+        RAW_DIR.mkdir(parents=True, exist_ok=True)
         for item in all_links:
             fname = safe_filename(item["label"], item["url"])
             dest = RAW_DIR / fname
-            download_file(item["url"], dest)
-            item["local_path"] = str(dest)
-            time.sleep(0.3)
+            ok = download_file(item["url"], dest)
+            item["local_path"] = str(dest) if ok else None
+            item["downloaded"] = ok
+            time.sleep(0.4)
 
     return all_links
 
 
+# ── Manual import helper ─────────────────────────────────────────────────────
+
+def register_manual(file_path: str, year: int, direction: str) -> dict:
+    """
+    Register a manually downloaded Excel file.
+    Usage: python -c "from scraper.irica_scraper import register_manual; register_manual('~/Downloads/export_1402.xlsx', 1402, 'export')"
+    """
+    src = Path(file_path).expanduser().resolve()
+    if not src.exists():
+        raise FileNotFoundError(src)
+    dest = RAW_DIR / f"{direction}_{year}__{src.name}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    import shutil
+    shutil.copy2(src, dest)
+    log.info("Registered: %s → %s", src.name, dest)
+    return {"local_path": str(dest), "year": year, "direction": direction}
+
+
 if __name__ == "__main__":
     results = scrape(download=True)
-    print(f"\n{'='*60}")
-    print(f"Found {len(results)} files")
-    for r in results:
-        print(f"  [{r.get('label', '')}] {r['url']}")
+    if results:
+        print(f"\n{'='*60}")
+        print(f"Found {len(results)} files")
+        for r in results:
+            status = "✓" if r.get("downloaded") else "✗"
+            print(f"  [{status}] {r.get('label', '')} → {r['url'][:70]}")
+    else:
+        print("\nNo files found. Try running from a machine with access to irica.ir")
+        print("Or place Excel files manually in data/raw/ and run: python pipeline.py parse")

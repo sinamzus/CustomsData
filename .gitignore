@@ -6,3 +6,5 @@ data/raw/
 data/processed/
 *.parquet
 *.db
+deploy/ssl/
+.pytest_cache/
